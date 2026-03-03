@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="ro">
 <head>
@@ -589,33 +590,130 @@ async function loadReviews() {
     updateSummaryUI(stats);
 }
 
-    document.getElementById('submitReview').onclick = async () => {
-        const text = document.getElementById('revText').value.trim();
-        if(!window.selectedRating) return alert("Alege stelele!");
-        if(text.length < 5) return alert("Scrie o recenzie!");
-        await setDoc(doc(db, "reviews", auth.currentUser.uid), { uid: auth.currentUser.uid, name: auth.currentUser.displayName, photo: auth.currentUser.photoURL, rating: window.selectedRating, text, createdAt: serverTimestamp() });
-        location.reload();
-    };
+document.getElementById('submitReview').onclick = async () => {
+    const text = document.getElementById('revText').value.trim();
+    const btn = document.getElementById('submitReview');
+    
+    if(!window.selectedRating) return alert("Alege stelele!");
+    if(text.length < 5) return alert("Scrie o recenzie!");
+    
+    // Show loading state
+    btn.innerText = "Se trimite...";
+    btn.disabled = true;
+
+    try {
+        // Send to Firebase
+        await setDoc(doc(db, "reviews", auth.currentUser.uid), { 
+            uid: auth.currentUser.uid, 
+            name: auth.currentUser.displayName || "Client", 
+            photo: auth.currentUser.photoURL, 
+            rating: window.selectedRating, 
+            text, 
+            createdAt: serverTimestamp(),
+            votes: {} // Init empty votes
+        });
+
+        // Clear Form
+        document.getElementById('revText').value = "";
+        
+        // Hide Write Section & Show "Posted" Message manually without reload
+        document.getElementById('writeReviewSection').classList.add('hidden');
+        document.getElementById('alreadyPostedMsg').classList.remove('hidden');
+
+        // Reload the list just once (acceptable for a new post)
+        loadReviews(); 
+        
+    } catch (error) {
+        console.error(error);
+        alert("Eroare la trimitere: " + error.message);
+        btn.innerText = "TRIMITE RECENZIA";
+        btn.disabled = false;
+    }
+};
     document.getElementById('authForm').addEventListener('submit', window.authFunctions.handleEmailAuth);
 
 
 
-
-// --- VOTARE (LIKE/DISLIKE) ---
 window.voteReview = async (reviewId, type) => {
     if (!window.currentUser) return toggleAuthModal();
-    const ref = doc(db, "reviews", reviewId);
-    const snap = await getDoc(ref);
-    if (!snap.exists()) return;
 
-    let votes = snap.data().votes || {};
-    if (votes[window.currentUser.uid] === type) {
-        delete votes[window.currentUser.uid]; // Scoate votul dacă apasă iar
-    } else {
-        votes[window.currentUser.uid] = type;
+    // 1. Get UI Elements
+    const btnLike = document.querySelector(`button[onclick="voteReview('${reviewId}', 1)"]`);
+    const btnDislike = document.querySelector(`button[onclick="voteReview('${reviewId}', -1)"]`);
+    const spanLike = btnLike.querySelector('span');
+    const spanDislike = btnDislike.querySelector('span');
+    
+    // 2. Parse current values
+    let likes = parseInt(spanLike.innerText) || 0;
+    let dislikes = parseInt(spanDislike.innerText) || 0;
+    
+    // 3. Determine current user state based on CSS classes
+    const isLiked = btnLike.classList.contains('border-brand-magenta');
+    const isDisliked = btnDislike.classList.contains('border-red-500');
+
+    // 4. OPTIMISTIC UPDATE (Update screen INSTANTLY)
+    // Reset styles first
+    btnLike.className = "flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-[10px] hover:bg-brand-magenta/20 transition-all";
+    btnDislike.className = "flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 text-[10px] hover:bg-red-500/20 transition-all";
+
+    let newVote = null; // Default: removing vote
+
+    if (type === 1) {
+        if (isLiked) {
+            // User is removing like
+            likes--;
+            newVote = null;
+        } else {
+            // User is liking (remove dislike if exists)
+            likes++;
+            if (isDisliked) dislikes--;
+            newVote = 1;
+            btnLike.classList.add('border-brand-magenta', 'text-brand-magenta', 'bg-brand-magenta/10');
+            btnLike.classList.remove('bg-white/5', 'border-white/10');
+        }
+    } else if (type === -1) {
+        if (isDisliked) {
+            // User is removing dislike
+            dislikes--;
+            newVote = null;
+        } else {
+            // User is disliking (remove like if exists)
+            dislikes++;
+            if (isLiked) likes--;
+            newVote = -1;
+            btnDislike.classList.add('border-red-500', 'text-red-500', 'bg-red-500/10');
+            btnDislike.classList.remove('bg-white/5', 'border-white/10');
+        }
     }
-    await updateDoc(ref, { votes });
-    loadReviews(); // Refresh instant
+
+    // Update numbers on screen
+    spanLike.innerText = likes;
+    spanDislike.innerText = dislikes;
+
+    // 5. Send to Firebase in BACKGROUND (Don't await, don't reload list)
+    const ref = doc(db, "reviews", reviewId);
+    
+    // We use a transaction or simple update. For speed, we do a simple logic here:
+    // Note: To be perfectly safe against race conditions we'd use getDoc first, 
+    // but for UI speed we assume local state is close enough.
+    try {
+        const snap = await getDoc(ref);
+        if (snap.exists()) {
+            let votes = snap.data().votes || {};
+            if (newVote === null) {
+                delete votes[window.currentUser.uid];
+            } else {
+                votes[window.currentUser.uid] = newVote;
+            }
+            await updateDoc(ref, { votes });
+        }
+    } catch (e) {
+        console.error("Vote failed", e);
+        // Optional: Revert UI if error occurs
+    }
+    
+    // CRITICAL: DO NOT CALL loadReviews() HERE! 
+    // This stops the lag.
 };
 
 // --- AFISARE COMENTARII ---
@@ -648,22 +746,58 @@ list.innerHTML += `
     }
 };
 
-// --- POSTARE COMENTARIU ---
 window.postComment = async (reviewId) => {
     const input = document.getElementById(`input-${reviewId}`);
     const text = input.value.trim();
     if (!text) return;
 
-    await addDoc(collection(db, `reviews/${reviewId}/comments`), {
-        uid: window.currentUser.uid,
-        name: window.currentUser.displayName,
-        photo: window.currentUser.photoURL,
-        email: window.currentUser.email,
-        text: text,
-        createdAt: serverTimestamp()
-    });
-    input.value = "";
-    window.toggleComments(reviewId); // Refresh comments list
+    // 1. Optimistic Update: Add HTML immediately
+    const list = document.getElementById(`comment-list-${reviewId}`);
+    // Check if "no comments" message exists and remove it
+    if(list.innerText.includes("Niciun răspuns")) list.innerHTML = "";
+
+    const tempId = "temp-" + Date.now();
+    const isOwner = window.currentUser.email === 'hancimaria39@gmail.com'; // Adjust logic if needed
+
+    const tempHTML = `
+        <div id="${tempId}" class="flex gap-3 items-start bg-white/5 p-3 rounded-xl border border-white/5 opacity-50">
+            <img src="${window.currentUser.photoURL || 'https://i.pravatar.cc/150'}" class="w-6 h-6 rounded-full">
+            <div class="flex-1">
+                <p class="text-[10px] font-bold text-brand-ice">
+                    ${window.currentUser.displayName || 'Eu'} 
+                    ${isOwner ? '<span class="text-[7px] bg-brand-magenta text-white px-1.5 py-0.5 rounded-full uppercase ml-1">Owner</span>' : ''}
+                    <span class="text-[8px] ml-2 italic text-brand-magenta">se trimite...</span>
+                </p>
+                <p class="text-[11px] text-white/70">${text}</p>
+            </div>
+        </div>
+    `;
+    list.insertAdjacentHTML('beforeend', tempHTML);
+    input.value = ""; // Clear input immediately
+
+    try {
+        // 2. Send to Firebase
+        await addDoc(collection(db, `reviews/${reviewId}/comments`), {
+            uid: window.currentUser.uid,
+            name: window.currentUser.displayName || "Client",
+            photo: window.currentUser.photoURL,
+            email: window.currentUser.email,
+            text: text,
+            createdAt: serverTimestamp()
+        });
+
+        // 3. Confirm success (Update UI opacity)
+        const tempEl = document.getElementById(tempId);
+        if(tempEl) {
+            tempEl.classList.remove('opacity-50');
+            tempEl.querySelector('.text-brand-magenta').remove(); // remove "se trimite..."
+        }
+
+    } catch (err) {
+        alert("Eroare la comentariu: " + err.message);
+        document.getElementById(tempId).remove(); // Remove if failed
+    }
+    // Do NOT call toggleComments() here, it causes lag.
 };
 
 // --- STERGERE RECENZIE ---
